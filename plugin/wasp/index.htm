@@ -1,0 +1,1223 @@
+<html>
+<head>
+<meta charset="utf-8">
+<title>WASP - Waveform, Spectrogram and Pitch Display</title>
+
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+<link rel="stylesheet" type="text/css" href="wasp.css">
+
+<script type="text/javascript" src="AudioContextMonkeyPatch.js"></script>
+<script type="text/javascript" src="flotr2.js"></script>
+<script type="text/javascript" src="fft.js"></script>
+<script type="text/javascript" src="filter.js"></script>
+<script type="text/javascript" src="fxswipe.js"></script>
+<script type="text/javascript" src="screenfull.js"></script>
+<script>
+//
+// (c) 2015 Mark Huckvale University College London
+//
+// manifest constants
+var SRATE=48000;	// sampling rate (fixed by Audio object)
+var FRMAX=8000;		// display up to 8000Hz
+var FXRATE=200;   // fundamental frequency rate
+var WSIZE=2048;		// live window size = about 46ms.
+var QSIZE=2*WSIZE;	// length of live ring buffer
+
+// display
+var dispwave=1;
+var dispspect=1;
+var disppitch=1;
+
+// audio
+var context=null;
+var capturestream=null;
+var micsource=null;
+var capturenode=null;
+var recording=0;
+var playing=0;
+var wavegraph=null;
+
+// audio file
+var filename="Waveform";
+var fsignal=new Float32Array(SRATE);
+var filedata=null;
+var fileblob=null;
+var fileurl=null;
+var flcursor=-1;
+var frcursor=-1;
+var fstack=[];
+var ffx=[];
+var fvs=[];
+var ffxlen=0;
+var ffxlo=62.5,ffxhi=500;
+
+// audio capture
+var signal=new Float32Array(QSIZE);
+var sigmax=0;
+var sigpos=0;
+var siglen=0;
+var sigcap;
+
+// spectrogram image
+var spimage=new Image();
+
+// utility function
+function $(obj) { return document.getElementById(obj); }
+
+// send a message to the console
+function trace(message){
+	console.log(message);
+}
+
+// get screen size and calculate co-ordinates of screen centre
+function screensize()
+{
+	var e = window, a = 'inner';
+	if ( !( 'innerWidth' in window ) ) {
+		a = 'client';
+		e = document.documentElement || document.body;
+	}
+	return { width : e[a+'Width'], height : e[a+'Height'], cx : e[ a+'Width' ]/2 , cy : e[ a+'Height' ]/2 }
+}
+
+// display the live signal
+function displaywave(target)
+{
+	var
+		container = document.getElementById(target),
+		data, i, idx, samp, tidx, tval;
+
+	// find suitable trigger point
+	idx = (sigpos + QSIZE - WSIZE - SRATE/100) % QSIZE;
+	tval = signal[idx];
+	for (i=0;i<SRATE/100;i++) {
+		if (signal[idx] < tval) {
+			tval = signal[idx];
+			tidx = idx;
+		}
+		idx=(idx+1)%QSIZE;
+	}
+
+	// load signal into graph
+	data = new Array(WSIZE);
+	idx=tidx;
+	for (i=0;i<WSIZE;i++) {
+		samp = signal[idx];
+		idx = (idx + 1) % QSIZE;
+		data[i] = [ i/SRATE, samp ];
+	}
+
+	// Draw Graph
+	wavegraph = Flotr.draw(container, [ data ], {
+		shadowSize : 0,
+		xaxis : {
+			title : "Time (s)"
+		},
+		yaxis : {
+			title : "Amplitude",
+			titleAngle : 90,
+			min : -sigmax,
+			max : sigmax
+		},
+		HtmlText : false,
+	} );
+
+}
+
+// display the recorded signal
+function displaysignal(target)
+{
+	var
+		container = document.getElementById(target),
+		data, cldata, crdata, i, factor, min, max;
+
+	// get start and length from stack
+	var ssamp = Math.round(fstack[0][0]*SRATE);
+	var esamp = Math.round(fstack[0][1]*SRATE);
+	var nsamp = esamp-ssamp;
+
+	// temporal compression factor for faster drawing - assume max 2000 pixels
+	factor=Math.floor(nsamp/2000);
+	if (factor < 1) factor=1;
+
+	// load signal into graph
+	data = [];
+	for (i=0;i<fsignal.length;i+=factor) {
+		min=fsignal[ssamp+i];
+		max=fsignal[ssamp+i];
+		for (j=1;j<factor;j++) {
+			if (fsignal[ssamp+i+j] < min) min=fsignal[ssamp+i+j];
+			if (fsignal[ssamp+i+j] > max) max=fsignal[ssamp+i+j];
+		}
+		data.push([ (i+ssamp)/SRATE, min ]);
+		if (min!=max) data.push([ (i+ssamp)/SRATE, max ]);
+	}
+
+	cldata = [];
+	if ((0<flcursor)&&(flcursor<fsignal.length/SRATE)) {
+		cldata.push( [ flcursor, -1 ]);
+		cldata.push( [ flcursor, 1 ]);
+	}
+	crdata = [];
+	if ((0<frcursor)&&(frcursor<fsignal.length/SRATE)) {
+		crdata.push( [ frcursor, -1 ]);
+		crdata.push( [ frcursor, 1 ]);
+	}
+
+	// Draw Graph
+	wavegraph = Flotr.draw(container, [ data, cldata, crdata ], {
+		shadowSize : 0,
+		xaxis : {
+			title : "Time (s)",
+			min : fstack[0][0],
+			max : fstack[0][1]
+		},
+		yaxis : {
+			title : "Amplitude",
+			titleAngle : 90,
+			min: -1.0,
+			max: 1.0
+		},
+		HtmlText : false,
+		grid: {
+		  backgroundColor: "white"
+		}
+	} );
+
+}
+
+// get the spectrogram dimensions
+function sizegram(target)
+{
+	var
+		container = document.getElementById(target),
+		data, graph, i;
+
+	// load signal into graph
+	data = [];
+
+	// Draw Graph
+	graph = Flotr.draw(container, [ data ], {
+		shadowSize : 0,
+		xaxis : {
+			title : "Time (s)",
+			min : fstack[0][0],
+			max : fstack[0][1]
+		},
+		yaxis : {
+			title : "Frequency (Hz)",
+			titleAngle : 90,
+			min : 0,
+			max : FRMAX
+		},
+		HtmlText : false
+	} );
+	return { width:graph.plotWidth, height:graph.plotHeight };
+}
+
+// display the spectrogram
+function displaygram(target,spimage)
+{
+	var
+		container = document.getElementById(target),
+		data, cldata, crdata, graph, i;
+
+	// get start and length from stack
+	var ssamp = Math.round(fstack[0][0]*SRATE);
+	var esamp = Math.round(fstack[0][1]*SRATE);
+	var nsamp = esamp-ssamp;
+
+	// load signal into graph
+	data = [];
+
+	cldata = [];
+	if ((0<flcursor)&&(flcursor<fsignal.length/SRATE)) {
+		cldata.push( [ flcursor, 0 ]);
+		cldata.push( [ flcursor, FRMAX ]);
+	}
+	crdata = [];
+	if ((0<frcursor)&&(frcursor<fsignal.length/SRATE)) {
+		crdata.push( [ frcursor, 0 ]);
+		crdata.push( [ frcursor, FRMAX ]);
+	}
+
+	// Draw Graph
+	wavegraph = Flotr.draw(container, [ data, cldata, crdata ], {
+		shadowSize : 0,
+		xaxis : {
+			title : "Time (s)",
+			min : fstack[0][0],
+			max : fstack[0][1]
+		},
+		yaxis : {
+			title : "Frequency (Hz)",
+			titleAngle : 90,
+			min : 0,
+			max : FRMAX
+		},
+		grid :{
+			backgroundImage : spimage
+		},
+		HtmlText : false
+	} );
+
+}
+
+// display the pitch track
+function displaypitch(target)
+{
+	var
+		container = document.getElementById(target),
+		data, cldata, crdata, i, factor, min, max;
+
+	// get start and length from stack
+	var ssamp = Math.round(fstack[0][0]*FXRATE);
+	var esamp = Math.round(fstack[0][1]*FXRATE);
+	var nsamp = esamp-ssamp;
+
+	// load signal into graph
+	data = [];
+	for (i=0;i<nsamp;i++) {
+    if (fvs[ssamp+i]>0.3)
+      data.push([ (i+ssamp)/FXRATE, ffx[ssamp+i] ]);
+	}
+
+	cldata = [];
+	if ((0<flcursor)&&(flcursor<fsignal.length/SRATE)) {
+		cldata.push( [ flcursor, ffxlo ]);
+		cldata.push( [ flcursor, ffxhi ]);
+	}
+	crdata = [];
+	if ((0<frcursor)&&(frcursor<fsignal.length/SRATE)) {
+		crdata.push( [ frcursor, ffxlo ]);
+		crdata.push( [ frcursor, ffxhi ]);
+	}
+
+	// Draw Graph
+	wavegraph = Flotr.draw(container,
+	   [ { data:data, points: { show:true }}, cldata, crdata ], {
+		shadowSize : 0,
+		xaxis : {
+			title : "Time (s)",
+			min : fstack[0][0],
+			max : fstack[0][1]
+		},
+		yaxis : {
+			title : "Fundamental Frequency (Hz)",
+			titleAngle : 90,
+			min: ffxlo,
+			max: ffxhi,
+      scaling: 'logarithmic',
+      base:10,
+      noTicks:6,
+      minorTickFreq:2,
+      tickDecimals:0,
+      autoscale:false
+		},
+		HtmlText : false,
+		grid: {
+		  backgroundColor: "white"
+		}
+	} );
+
+}
+
+var pitchworker=null;
+
+// calculate pitch
+function dopitch()
+{
+  // downsample by 3 before analysis
+  var nfsamp=Math.floor(fsignal.length/3);
+  var ffsignal=new Float32Array(nfsamp);
+  var filt=new Filter();
+  filt.design(filt.LOW_PASS,4,SRATE/3,SRATE/3,SRATE);
+  for (var i=0;i<nfsamp;i++) {
+    filt.sample(fsignal[3*i]);
+    filt.sample(fsignal[3*i+1]);
+    ffsignal[i]=filt.sample(fsignal[3*i+2]);
+  }
+
+  // create worker thread for calculation
+  pitchworker= new Worker("fxswipe.js");
+  pitchworker.onmessage=function(event) {
+      console.timeEnd("FXSwipe");
+      ffx=event.data.fx;
+      fvs=event.data.vs;
+      ffxlen=event.data.fxlen;
+//      ffxlo=500;
+//      ffxhi=50;
+//      for (var i=0;i<ffxlen;i++) if (fvs[i]>0.3) {
+//        if (ffx[i] < ffxlo) ffxlo=ffx[i];
+//        if (ffx[i] > ffxhi) ffxhi=ffx[i];
+//      }
+//      ffxlo -= 10;
+//      ffxhi += 10;
+//      if (ffxlo < 50) ffxlo=50;
+//      if (ffxhi > 500) ffxhi=500;
+
+			// draw pitch track
+			displaypitch("pgraph");
+		}
+
+	// generate pitch in worker thread
+	console.time("FXSwipe");
+	pitchworker.postMessage({ signal : ffsignal, srate: SRATE/3 });
+
+}
+
+var worker=null;
+var scanvas=null;
+
+// create audio context
+function createcontext()
+{
+	// create context - once only
+	if (context==null) {
+		try {
+			context = new window.AudioContext();
+			trace("context.sampleRate="+context.sampleRate);
+			SRATE=context.sampleRate;
+			//context.createGainNode();		// this may be a fix for iPad
+		}
+		catch(e) {
+			alert('Web Audio API is not supported in this browser. Try Chrome, Firefox or Safari.');
+		}
+	}
+}
+
+// scroll left
+function doScrollLeft()
+{
+	var stime=fstack[0][0];
+	var etime=fstack[0][1];
+  var dur=etime-stime;
+  stime=stime-dur;
+  if (stime < 0) stime=0;
+  etime=stime+dur;
+  fstack.shift();
+	fstack.unshift([ stime, etime ]);
+	dographs();
+}
+
+// scroll right
+function doScrollRight()
+{
+	var stime=fstack[0][0];
+	var etime=fstack[0][1];
+  var dur=etime-stime;
+  etime=etime+dur;
+  if (etime > fsignal.length/SRATE) etime=fsignal.length/SRATE;
+  stime=etime-dur;
+  fstack.shift();
+	fstack.unshift([ stime, etime ]);
+	dographs();
+}
+
+// zoom in
+function doZoomIn()
+{
+	var stime=fstack[0][0];
+	var etime=fstack[0][1];
+	if ((flcursor<0) && (frcursor <0)) {
+	 var dur=etime-stime;
+	 stime += dur/3;
+	 etime -= dur/3;
+	}
+	if ((stime<=flcursor)&&(flcursor<=etime)) stime=flcursor;
+	if ((stime<=frcursor)&&(frcursor<=etime)) etime=frcursor;
+	if (etime < stime) {
+	 var t=stime;
+	 stime=stime;
+	 etime=t;
+	}
+	fstack.unshift([ stime, etime ]);
+	dographs();
+}
+
+// zoom out
+function doZoomOut()
+{
+	if (fstack.length > 1) fstack.shift();
+	dographs();
+}
+
+// control number & speed of animation
+var lasttim=0;
+function animatewave(tim)
+{
+	if (tim==lasttim) return;
+	lasttim=tim;
+	if (dispwave) {
+		if (recording!=0)
+			displaywave("wgraph");
+		else
+			displaysignal("wgraph");
+	}
+}
+	
+// scroll waveform only
+function scrollWaveformBy(delta)
+{
+//	trace("scrollWaveformBy("+delta+")");
+	var stime=fstack[0][0];
+	var etime=fstack[0][1];
+	var dur=etime-stime;
+	stime=stime+delta;
+	if (stime < 0) stime=0;
+	etime=stime+dur;
+	if (etime > fsignal.length/SRATE) etime=fsignal.length/SRATE;
+	stime=etime-dur;
+	if ((stime!=fstack[0][0])||(etime!=fstack[0][1])) {
+		if (fstack.length>1) fstack.shift();			// replace rather than stack
+		fstack.unshift([ stime, etime ]);
+		if (dispwave) {
+			requestAnimationFrame(animatewave);
+		}
+		return 1;
+	}
+	else
+		return 0;
+}
+
+// zoom waveform only
+function zoomWaveformTo(stime,etime)
+{
+//	trace("zoomWaveformTo("+stime+","+etime+")");
+	var dur=etime-stime;
+	if (dur > fsignal.length/SRATE) dur=fsignal.length/SRATE;
+	if (stime < 0) {
+		stime=0;
+		etime=stime+dur;
+	}
+	if (etime > fsignal.length/SRATE) etime=fsignal.length/SRATE;
+	stime=etime-dur;
+	if ((stime!=fstack[0][0])||(etime!=fstack[0][1])) {
+		if (fstack.length>1) fstack.shift();			// replace rather than stack
+		fstack.unshift([ stime, etime ]);
+		if (dispwave) {
+			requestAnimationFrame(animatewave);
+		}
+		return 1;
+	}
+	else
+		return 0;
+}
+
+
+var timer;
+
+// start audio processing
+function startrecording(stream)
+{
+	capturestream = stream;
+	micsource = context.createMediaStreamSource(stream);
+	capturenode = context.createScriptProcessor(8192, 1, 1);
+	capturenode.onaudioprocess = function(e) {
+		if (recording) {
+			var buf=e.inputBuffer.getChannelData(0);
+			for (i=0;i<buf.length;i++) {
+				if (buf[i] > sigmax) sigmax = buf[i];
+				if (buf[i] < -sigmax) sigmax = -buf[i];
+				signal[sigpos] = buf[i];
+				sigpos = (sigpos+1) % QSIZE;
+				sigcap.push(buf[i]);
+				siglen++;
+			}
+		}
+	};
+
+	// connect microphone to processing node
+	micsource.connect(capturenode);
+	capturenode.connect(context.destination);
+
+}
+
+// start/pause recording
+function doRecord()
+{
+  createcontext();
+
+	if (!recording) {
+		sigmax=0;
+		sigcap = new Array();
+		siglen=0;
+		sigpos=0;
+	}
+
+	if (micsource==null) {
+		navigator.getMedia = ( navigator.getUserMedia ||
+                         navigator.webkitGetUserMedia ||
+                         navigator.mozGetUserMedia ||
+                         navigator.msGetUserMedia);
+
+		navigator.getMedia({audio:{ optional: [ {googNoiseSuppression: false},{googNoiseSuppression2: false} ]}}, startrecording, function() { alert('getUserMedia() failed - use https: address'); });
+	}
+
+	// start/pause function
+	if (recording) {
+		window.clearInterval(timer);
+		recording=0;
+		trace("Got "+siglen+" samples");
+		fsiglen=siglen;
+		fsignal=new Float32Array(fsiglen);
+		for (var i=0;i<fsiglen;i++) fsignal[i]=sigcap[i]/sigmax;
+		flcursor=-1;
+		frcursor=-1;
+		fstack=[];
+		fstack.push([ 0, siglen/SRATE ]);
+		dopitch();
+		dographs();
+    $('recbutton').innerHTML="Record";
+    	closedown();
+
+	}
+	else {
+		recording=1;
+		timer = window.setInterval(function() { if (dispwave) displaywave("wgraph"); },100);
+    $('recbutton').innerHTML="Stop";
+	}
+
+}
+
+function doPlay()
+{
+  createcontext();
+
+  if (playing) {
+    sendsrc.stop();
+    playing=0;
+    $('plybutton').innerHTML="Play";
+  }
+  else {
+	// get start and end time
+	var stime=fstack[0][0];
+	var etime=fstack[0][1];
+	if ((stime<=flcursor)&&(flcursor<=etime)) stime=flcursor;
+	if ((stime<=frcursor)&&(frcursor<=etime)) etime=frcursor;
+	if (etime < stime) {
+		var t=stime;
+		stime=stime;
+		etime=t;
+	}
+
+	// get start and length samples
+	var ssamp = Math.round(stime*SRATE);
+	var esamp = Math.round(etime*SRATE);
+	var nsamp = esamp-ssamp;
+
+  	// create audio buffer source node
+  	sendsrc = context.createBufferSource();
+  	sendbuf = context.createBuffer(1,nsamp,SRATE);
+
+  	// copy in the signal
+  	senddat = sendbuf.getChannelData(0);
+  	for (i=0;i<nsamp;i++) senddat[i] = fsignal[ssamp+i];
+
+  	// kick it off
+  	sendsrc.buffer = sendbuf;
+  	sendsrc.loop = false;
+    sendsrc.onended=function() { playing=0; $('plybutton').innerHTML="Play"; };
+  	sendsrc.connect(context.destination);
+  	sendsrc.start(context.currentTime + 0.01);		// this may be a fix for iPad
+    $('plybutton').innerHTML="Stop";
+    playing=1;
+  }
+}
+
+// detect mouse click
+function onclick(evt)
+{
+	evt = evt || window.event;
+	var pos=wavegraph.getEventPosition(evt);
+
+	if (recording==0) switch (evt.which) {
+	case 1: trace("left click at "+pos.x+","+pos.y);
+		if (flcursor!=pos.x) {
+			flcursor = pos.x;
+		}
+		else {
+			flcursor = -1;
+		}
+		if (dispwave) displaysignal('wgraph');
+		if (dispspect) displaygram("sgraph",spimage);
+		if (disppitch) displaypitch("pgraph");
+		break;
+  case 3: trace("right click at "+pos.x+","+pos.y);
+		if (frcursor!=pos.x) {
+			frcursor = pos.x;
+		}
+		else {
+			frcursor = -1;
+		}
+		if (dispwave) displaysignal('wgraph');
+		if (dispspect) displaygram("sgraph",spimage);
+		if (disppitch) displaypitch("pgraph");
+   	break;
+	}
+	evt.preventDefault();
+  evt.stopPropagation();
+  return false;
+}
+
+var ongoingTouches = [];
+var someTouch=0;
+var	lastLeft=0;
+var	lastRight=0;
+
+function copyTouch(touch) {
+	return { identifier: touch.identifier, pageX: touch.pageX, pageY: touch.pageY };
+}
+
+function ongoingTouchIndexById(idToFind) {
+	for (var i = 0; i < ongoingTouches.length; i++) {
+		var id = ongoingTouches[i].identifier;
+
+		if (id == idToFind) {
+			return i;
+		}
+	}
+	return -1;    // not found
+}
+
+function ontouchstart(evt) {
+	evt.preventDefault();
+	var touches = evt.changedTouches;
+//	trace("TouchStart:"+touches.length);
+	if (ongoingTouches.length==0) someTouch=0;
+	for (var i = 0; i < touches.length; i++) {
+		ongoingTouches.push(copyTouch(touches[i]));
+	}
+	if (ongoingTouches.length==2) {
+		lastLeft=ongoingTouches[0].pageX;
+		lastRight=ongoingTouches[1].pageX;
+		if (lastLeft > lastRight) {
+			var tmp=lastLeft;
+			lastLeft=lastRight;
+			lastRight=tmp;
+		}
+	}
+	else {
+		lastleft=-1;
+		lastRight=-1;
+	}
+}
+
+function ontouchmove(evt) {
+	evt.preventDefault();
+	var touches = evt.changedTouches;
+//	trace("TouchMove:"+touches.length);
+
+	// chrome on Android doesn't give touch start messages?
+	if (ongoingTouches.length<touches.length) {
+		// remove existing touches
+		for (var i = 0; i < touches.length; i++) {
+			ongoingTouches.splice(i, 1);  // remove it; done
+		}
+		// add afresh
+		ontouchstart(evt);
+	}
+
+	if ((ongoingTouches.length==1)&&(touches.length==1)&&(ongoingTouches[0].identifier==touches[0].identifier)) {
+		// a single moving touch - scroll
+		var stime=fstack[0][0];
+		var etime=fstack[0][1];
+		var deltatime=(etime-stime)*(ongoingTouches[0].pageX-touches[0].pageX)/wavegraph.plotWidth;
+		someTouch += scrollWaveformBy(deltatime);
+	}
+
+	if ((ongoingTouches.length==2)&&(touches.length==2)&&(lastLeft>=0)&&(lastRight>=0)) {
+		var newLeft=touches[0].pageX;
+		var newRight=touches[1].pageX;
+		if (newLeft > newRight) {
+			var tmp=newLeft;
+			newLeft=newRight;
+			newRight=tmp;
+		}
+		var stime=fstack[0][0];
+		var etime=fstack[0][1];
+		var dur=etime-stime;
+		var width=wavegraph.plotWidth;
+		var plotrect=document.getElementById("wgraph").getBoundingClientRect();
+		var xoffset=plotrect.left+wavegraph.plotOffset.left;
+
+		var newDur=dur*((lastRight-xoffset)/width-(lastLeft-xoffset)/width)/((newRight-xoffset)/width-(newLeft-xoffset)/width);
+		var newStime=stime+((lastLeft-xoffset)/width)*dur-((newLeft-xoffset)/width)*newDur;
+//		trace("new stime="+newStime+" etime="+(newStime+newDur));
+		someTouch += zoomWaveformTo(newStime,newStime+newDur);
+		lastLeft=newLeft;
+		lastRight=newRight;
+	}
+
+	for (var i = 0; i < touches.length; i++) {
+		var idx = ongoingTouchIndexById(touches[i].identifier);
+		if (idx >= 0) {
+			ongoingTouches.splice(idx, 1, copyTouch(touches[i]));  // swap in the new touch record
+		}
+	}
+}
+
+function ontouchend(evt) {
+	evt.preventDefault();
+	var touches = evt.changedTouches;
+//	trace("TouchEnd:"+touches.length);
+
+	for (var i = 0; i < touches.length; i++) {
+		var idx = ongoingTouchIndexById(touches[i].identifier);
+		if (idx >= 0) {
+			ongoingTouches.splice(idx, 1);  // remove it; we're done
+		}
+	}
+	if (someTouch) dographs();
+	someTouch=0;
+}
+
+function ontouchcancel(evt) {
+	evt.preventDefault();
+	var touches = evt.changedTouches;
+
+	for (var i = 0; i < touches.length; i++) {
+		ongoingTouches.splice(i, 1);  // remove it; done
+	}
+	if (someTouch) dographs();
+	someTouch=0;
+}
+
+function oncontextmenu(evt)
+{
+	trace("oncontextmenu()");
+	evt = evt || window.event;
+	evt.preventDefault();
+  evt.stopPropagation();
+  return false;
+}
+
+// dialog cancel button handler
+function cancel(dlg)
+{
+	$('mask').style.visibility='hidden';
+	$(dlg).style.visibility='hidden';
+}
+
+// set bytes in a buffer
+function writeUTFBytes(view, offset, string)
+{
+	var lng = string.length;
+	for (var i = 0; i < lng; i++) {
+		view.setUint8(offset + i, string.charCodeAt(i));
+	}
+}
+
+// make a WAV file from signal
+function makeWAV(signal)
+{
+  var buffer = new ArrayBuffer(44 + signal.length * 2);
+	var view = new DataView(buffer);
+
+  // RIFF chunk descriptor
+	writeUTFBytes(view, 0, 'RIFF');
+	view.setUint32(4, 44 + signal.length * 2, true);
+	writeUTFBytes(view, 8, 'WAVE');
+	// FMT sub-chunk
+	writeUTFBytes(view, 12, 'fmt ');
+	view.setUint32(16, 16, true);
+	view.setUint16(20, 1, true);
+	view.setUint16(22, 1, true);
+	view.setUint32(24, SRATE, true);
+	view.setUint32(28, SRATE * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+	// data sub-chunk
+	writeUTFBytes(view, 36, 'data');
+	view.setUint32(40, signal.length * 2, true);
+
+	// write the PCM samples
+	var lng = signal.length;
+	var index = 44;
+	for (var i = 0; i < lng; i++) {
+		view.setInt16(index, signal[i] * 30000, true);
+		index += 2;
+	}
+
+	// our final binary blob
+	var blob = new Blob ( [ view ], { type : 'audio/wav' } );
+	return blob;
+}
+
+// save file
+function doSave()
+{
+	var a = document.createElement('a');
+	a.href = window.URL.createObjectURL(makeWAV(fsignal));
+	a.download = 'download.wav';
+	var event = document.createEvent("MouseEvents");
+  event.initMouseEvent(
+       "click", true, false, window, 0, 0, 0, 0, 0
+       , false, false, false, false, 0, null
+  );
+  a.dispatchEvent(event);
+//	a.click();
+}
+
+// open a file
+function onopenfiledlg()
+{
+  $('mask').style.visibility='hidden';
+	$('openfiledlg').style.visibility='hidden';
+	var file = $('filechoice').files[0];
+	filename = file.name;
+
+  createcontext();
+
+	var reader = new FileReader();
+	reader.onload = function(e) {
+		trace("reader.readyState="+reader.readyState);
+		filedata = e.target.result;
+		trace("filedata.length="+filedata.byteLength);
+		fileblob = new Blob([filedata], {type: 'audio/wav'});
+		fileurl = URL.createObjectURL(fileblob);
+    context.decodeAudioData(filedata,
+    		function onSuccess(buffer) {
+				  var siglen = buffer.length;
+				  fsignal = new Float32Array(siglen);
+				  var srcbuf = buffer.getChannelData(0);
+				  sigmax=0;
+				  for (i=0;i<siglen;i++) {
+            var s = srcbuf[i];
+					  if (s > sigmax) sigmax=s;
+            if (s < -sigmax) sigmax = -s;
+  				}
+          for (i=0;i<siglen;i++) {
+            fsignal[i] = srcbuf[i]/sigmax;
+          }
+          flcursor=-1;
+          frcursor=-1;
+  				fstack=[];
+  				fstack.push([ 0, siglen/SRATE ]);
+  				dopitch();
+	        dographs();
+    		},
+    		function onFailure() {
+    			trace("decodeAudioData failed");
+    		}
+    	);
+	};
+	reader.readAsArrayBuffer(file);
+}
+
+function dokey(event)
+{
+	var keyCode = ('which' in event) ? event.which : event.keyCode;
+	console.log("keyCode="+keyCode);
+	if (recording) {
+	}
+	else {
+		if (keyCode==32) doPlay();
+		if (keyCode==90) doZoomIn();
+		if (keyCode==85) doZoomOut();
+		if (keyCode==76) doScrollLeft();
+		if (keyCode==82) doScrollRight();
+	}
+}
+
+// on configuration
+function onconfigdlg()
+{
+  dispwave = $('dispwave').checked ? 1 : 0;
+  dispspect = $('dispspect').checked ? 1 : 0;
+  disppitch = $('disppitch').checked ? 1 : 0;
+  if (!dispwave && !dispspect  && !disppitch) dispwave=1;
+	$('mask').style.visibility='hidden';
+	$('configdlg').style.visibility='hidden';
+  doresize();
+}
+
+// load file
+function doLoad()
+{
+	$('mask').style.visibility='visible';
+	var dlg=$('openfiledlg');
+	dlg.style.top = screensize().cy - dlg.offsetHeight/2;
+	dlg.style.left = screensize().cx - dlg.offsetWidth/2;
+	dlg.style.visibility='visible';
+}
+
+// about
+function doAbout()
+{
+	$('mask').style.visibility='visible';
+	var dlg=$('aboutdlg');
+	dlg.style.top = screensize().cy - dlg.offsetHeight/2;
+	dlg.style.left = screensize().cx - dlg.offsetWidth/2;
+	dlg.style.visibility='visible';
+}
+
+// configure
+function doConfig()
+{
+	$('mask').style.visibility='visible';
+	var dlg=$('configdlg');
+	dlg.style.top = screensize().cy - dlg.offsetHeight/2;
+	dlg.style.left = screensize().cx - dlg.offsetWidth/2;
+  $('dispwave').checked=(dispwave!=0);
+  $('dispspect').checked=(dispspect!=0);
+  $('disppitch').checked=(disppitch!=0);
+	dlg.style.visibility='visible';
+}
+
+// display the graphs
+function dographs()
+{
+
+	// display the waveform
+  if (dispwave) {
+  	if (recording!=0)
+  		displaywave("wgraph");
+  	else
+  		displaysignal("wgraph");
+  }
+
+  // get the spectrogram size
+  if (dispspect) {
+    var sz=sizegram("sgraph");
+    trace("Spectrogram size = "+sz.width+" x "+sz.height);
+
+    // create new worker thread
+    if (worker==null) {
+      worker= new Worker("spectrogram.js");
+
+      // display results of worker
+      worker.onmessage=function(event) {
+        console.timeEnd("Spectrogram");
+        // copy the image
+        var dc = scanvas.getContext("2d");
+        dc.putImageData(event.data.image,0,0);
+  			spimage.src = scanvas.toDataURL("image/png");
+
+  			// draw spectrogram
+  			displaygram("sgraph",spimage);
+  		}
+  	}
+
+  	// create a suitable canvas to fit background of graph
+  	scanvas = document.createElement("canvas");
+  	scanvas.setAttribute('width', sz.width);
+  	scanvas.setAttribute('height', sz.height);
+  	var dc = scanvas.getContext("2d");
+
+  	// generate signals in worker thread
+  	// get start and length from stack
+  	var wsize = Math.round(0.006*SRATE);
+  	var ssamp = Math.round(fstack[0][0]*SRATE);
+  	var esamp = Math.round(fstack[0][1]*SRATE);
+  	var nsamp = esamp-ssamp+wsize;
+  	if (ssamp+nsamp > fsignal.length) nsamp=fsignal.length-ssamp;
+  	var siglen = esamp-ssamp;
+  	if (ssamp+siglen > fsignal.length) siglen=fsignal.length-ssamp;
+  	var sbuf = new Float32Array(nsamp);
+  	for (var i=0;i<nsamp;i++) sbuf[i] = fsignal[ssamp+i];
+  	console.time("Spectrogram");
+  //	trace("signal.length="+nsamp+" siglen="+siglen+" srate="+SRATE+" wsize="+wsize);
+  	worker.postMessage({ signal : sbuf, siglen : siglen, srate: SRATE, image : dc.getImageData(0,0,sz.width,sz.height), wsize:wsize });
+  }
+
+  // display pitch track
+  if (disppitch)
+  	displaypitch("pgraph");
+
+}
+
+function doFullScreen()
+{
+  if (screenfull.enabled) {
+    if (screenfull.isFullscreen)
+      screenfull.exit();
+    else
+      screenfull.request();
+  }
+	doresize();
+}
+
+// set sizes of graphs to fit screen
+function doresize()
+{
+  // main div
+  var mwidth=screensize().width-2;
+  var mheight=screensize().height-95;
+	$("main").style.width=mwidth+"px";
+	$("main").style.height=mheight+"px";
+
+	var wwidth=mwidth-10;
+
+  var ngraph=0;
+  if (dispwave) ngraph++;
+  if (dispspect) ngraph+=2;
+  if (disppitch) ngraph+=2;
+	var wheight=(mheight-30)/ngraph;
+
+  $('wgraph').innerHTML="";
+ 	$("wgraph").style.width=wwidth+"px";
+  if (dispwave)
+  	$("wgraph").style.height=wheight+"px";
+  else
+  	$("wgraph").style.height="0px";
+
+  $('sgraph').innerHTML="";
+	$("sgraph").style.width=wwidth+"px";
+  if (dispspect)
+  	$("sgraph").style.height=2*wheight+"px";
+  else
+  	$("sgraph").style.height="0px";
+
+  $('pgraph').innerHTML="";
+	$("pgraph").style.width=wwidth+"px";
+  if (disppitch)
+  	$("pgraph").style.height=2*wheight+"px";
+  else
+  	$("pgraph").style.height="0px";
+
+  dographs();
+}
+
+function initialise() {
+  // initialise time stack
+	fstack=[];
+	fstack.push([0, 1]);
+
+	// add event listeners for waveform
+	var sg=document.getElementById("wgraph");
+	Flotr.EventAdapter.observe(sg, 'flotr:mousedown', onclick);
+	Flotr.EventAdapter.observe(sg, 'flotr:contextmenu', oncontextmenu);
+
+	sg.addEventListener("touchstart", ontouchstart, false);
+	sg.addEventListener("touchend", ontouchend, false);
+	sg.addEventListener("touchcancel", ontouchcancel, false);
+	sg.addEventListener("touchmove", ontouchmove, false);
+
+	sg=document.getElementById("sgraph");
+	Flotr.EventAdapter.observe(sg, 'flotr:mousedown', onclick);
+	Flotr.EventAdapter.observe(sg, 'flotr:contextmenu', oncontextmenu);
+	sg.addEventListener("touchstart", ontouchstart, false);
+	sg.addEventListener("touchend", ontouchend, false);
+	sg.addEventListener("touchcancel", ontouchcancel, false);
+	sg.addEventListener("touchmove", ontouchmove, false);
+
+	sg=document.getElementById("pgraph");
+	Flotr.EventAdapter.observe(sg, 'flotr:mousedown', onclick);
+	Flotr.EventAdapter.observe(sg, 'flotr:contextmenu', oncontextmenu);
+	sg.addEventListener("touchstart", ontouchstart, false);
+	sg.addEventListener("touchend", ontouchend, false);
+	sg.addEventListener("touchcancel", ontouchcancel, false);
+	sg.addEventListener("touchmove", ontouchmove, false);
+
+
+  // resize and draw graphs
+  doresize();
+}
+
+// closedown
+function closedown()
+{
+	if (micsource!=null) micsource.disconnect(capturenode);
+	micsource=null;
+	if (capturenode!=null) capturenode.disconnect(context.destination);
+	capturenode=null;
+	if (capturestream!=null) {
+		var tracks=capturestream.getAudioTracks();
+		console.log("Found "+tracks.length+" audio tracks to close");
+		for (var i=0;i<tracks.length;i++) {
+			tracks[i].stop();
+			capturestream.removeTrack(tracks[i]);
+		}
+		capturestream=null;
+	}
+}
+
+window.onblur=function() {
+    console.log("onblur()");
+		window.clearInterval(timer);
+		recording=0;
+    $('recbutton').innerHTML="Record";
+   	closedown();
+}
+
+</script>
+    <style>
+    body { -webkit-user-select: none; }
+    </style>
+
+</head>
+<body onload="initialise()" onresize="doresize()" oncontextmenu="return false;" onkeydown="dokey(event)"  style="overflow:hidden">
+
+<div id="menubar">
+<div class="menubutton" onclick="doAbout()"><img src="wasplogo.png"></div>
+<div class="menubutton" onclick="doLoad()">Load</div>
+<div class="menubutton" onclick="doSave()">Save</div>
+<div class="menubutton" onclick="doRecord()" id="recbutton">Record</div>
+<div class="menubutton" onclick="doPlay()" id="plybutton">Play</div>
+<div class="menubutton" onclick="doZoomIn()">Zoom In</div>
+<div class="menubutton" onclick="doZoomOut()">Zoom Out</div>
+<div class="menubutton" onclick="doScrollLeft()">Left</div>
+<div class="menubutton" onclick="doScrollRight()">Right</div>
+<div class="menubutton" onclick="doConfig()">Configure</div>
+<div class="menubutton" onclick="doFullScreen()">Full Screen</div>
+</div>
+
+<div id="main">
+
+<div class="graph" id="wgraph"></div>
+<div class="graph" id="sgraph"></div>
+<div class="graph" id="pgraph"></div>
+
+</div>
+
+<div id="footer">
+	<div align='right' id='fcredits'>
+	&copy; 2016 Mark Huckvale University College London
+	</div>
+</div>
+
+<!-- Screen overlay mask -->
+<div id="mask" class="background" style="visibility:hidden"></div>
+
+<!-- Load File Dialog -->
+<div id="openfiledlg" class="modal" style="visibility:hidden">
+<table border="0" cellpadding="3" cellspacing="3" width="100%">
+<tr><td><h3>Select Audio File</h3></td></tr>
+<tr><td height="60px"><input class="inputfile" type="file" id="filechoice"></td></tr>
+<tr><td><button class="button" onclick="onopenfiledlg()">OK</button><button class="button" onclick="cancel('openfiledlg')">Cancel</button></td></tr>
+</table>
+</div>
+
+<!-- Configuration Dialog -->
+<div id="configdlg" class="modal" style="visibility:hidden">
+<table border="0" cellpadding="3" cellspacing="3" width="100%">
+<tr><td colspan="3"><h3><center>WASP Configuration</center></h3></td></tr>
+<tr><td class="prompt"><input class="inputfield" type="checkbox" id="dispwave">Display Waveform</td>
+<tr><td class="prompt"><input class="inputfield" type="checkbox" id="dispspect">Display Spectrogram</td>
+<tr><td class="prompt"><input class="inputfield" type="checkbox" id="disppitch">Display Pitch Track</td>
+<tr><td>&nbsp;</td></tr>
+<tr><td><center><button class="button" onclick="onconfigdlg()">OK</button><button class="button" onclick="cancel('configdlg')">Cancel</button></center></td></tr>
+</table>
+</div>
+
+<!-- About Dialog -->
+<div id="aboutdlg" class="modal" style="visibility:hidden">
+<table border="0" cellpadding="3" cellspacing="3" width="100%">
+<tr><td><h3>WASP</h3>
+<p>Waveform, Spectrogram & Pitch
+<p>Version 1.2
+<p>&copy; 2016 Mark Huckvale
+<p>University College London
+<p><a href="http://www.speechandhearing.net/">www.speechandhearing.net</a>
+<p>August 2016
+</td></tr>
+<tr><td><button class="button" onclick="cancel('aboutdlg')">OK</button></td></tr>
+</table>
+</div>
+
+</body>
+
+
+</html>
