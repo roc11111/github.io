@@ -16,7 +16,6 @@
 
 <link rel="stylesheet" href="css/reset.css">
 <link rel="stylesheet" href="css/reveal.css">
-<link rel="stylesheet" href="css/custom.css">
 <link rel="stylesheet" href="css/theme/black.css" id="theme">
 <!--<link rel="stylesheet" media="(min-width: 568.01px)" href=".css">-->
 
@@ -62,8 +61,9 @@
 		</section>
 
 		<section>
-			<section>
+			<section id="content">
 				<h3>目录 Content syllabus</h3>
+				<div id="left">
 				<h5>1.Speaking Skill</h5>
 				<ol style="font-size: 80%;">
 					<li><a href="#/phonetics1">Phonetic Alphabet</li></a>
@@ -84,27 +84,39 @@
 					<li><a href="#/organization">Organization</li></a>
 					<li><a href="#/notes">Notes</li></a>
 				</ol>
-				<h6><a href="#/materials">Materials Download</h6></a></li>
-			</section>
-			<section id="materials">
-				<h5>资料 Materials</h5>
+				</div>
+
+				<div id="right">
+				<h5>工具箱 ToolBox</h5>
 				<ol style="font-size:80%;">
 					<li><a href="https://pan.baidu.com/s/1fsIL021kFdkqcp8vc3a5cw">新航道留学英语能力预备教程</li></a>
 					<li><a href="https://pan.baidu.com/s/11PdRgZAqpWzaA5lH6RR-bg">词汇搭配：EnglishPod</li></a>
 					<li><a href="https://pan.baidu.com/s/1yuOYB7OzALpd6-k2xka7aQ">Listen to This</li></a>
 					<li><a href="https://pan.baidu.com/s/1du0GfZiDwb_nKSAjENBJkw">托福听力真题：威学听力（20套）</li></a>
-					<li><a href="https://www.thesaurus.com">同义词查询：Thesaurus</li></a>
 					<li><a href="https://app.grammarly.com">语法纠错：Grammarly</li></a>
 					<li><a href="./resources/TPO1-15reading.docx" download="TPO1-15reading.docx">*TPO1-15 Reading*</li></a>
+					<li><a href="#/thesaurus">Thesaurus</li></a>
+					<li><a href="#/syllable">Syllable</li></a>
+					<li><a href="#/ampitch">Ampitch</li></a>
+					<li><a href="#/wasp">WASP</li></a>
 				</ol>
+				</div>
+				</section>
 
-			</section>
-				<section>
+				<section id="thesaurus">
+					<iframe class="stretch" src="https://www.thesaurus.com/"></iframe>
+					<h6>Thesaurus</h6>
+				</section>
+				<section id="syllable">
+					<iframe class="stretch" src="https://www.howmanysyllables.com/"></iframe>
+					<h6 style="display:none;">syllable</h6>
+				</section>
+				<section id="ampitch">
 					<div id="right"><iframe src="./plugin/ampitch/index.htm" width="600px" height="600px"></iframe></div>
 					<div id="left"><iframe src="./plugin/ampitch/index.htm" width="600px" height="600px"></iframe></div>
 					<h6 style="display:none;">Ampitch</h6>
 				</section>
-				<section>
+				<section id="wasp">
 					<iframe  class="stretch" src="./plugin/wasp/index.htm"></iframe>
 					<h6 style="display:none;">WASP</h6>
 				</section>
