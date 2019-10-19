@@ -1,0 +1,32 @@
+body
+{
+	margin:0;
+	padding:0;
+	background-color:#Fc9888;
+}
+.logo
+{
+	height: 25%;
+	position:relative;
+	height:150px;
+	cursor:pointer;
+}
+
+.bg
+{
+	size: :100%;
+	background-repeat:repeat-x;
+}
+
+.p
+{
+	color: white;
+	text-decoration:none;
+	font-size:32px;
+}
+.title
+{
+	font-size:48px;
+	text-align:center;
+	color: white;
+}
